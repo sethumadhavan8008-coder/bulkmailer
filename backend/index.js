@@ -1,4 +1,4 @@
-```javascript
+
 // backend/index.js
 
 require("dotenv").config();
@@ -21,12 +21,14 @@ const FRONTEND_URL = (
 ).replace(/\/+$/, "");
 
 const BACKEND_URL = (
-  process.env.BACKEND_URL || `http://localhost:${PORT}`
+  process.env.BACKEND_URL || "http://localhost:" + PORT
 ).replace(/\/+$/, "");
 
 const CALLBACK_URL =
   process.env.GOOGLE_CALLBACK_URL ||
-  `${BACKEND_URL}/auth/google/callback`;
+  BACKEND_URL + "/auth/google/callback";
+
+
 const REQUIRED_ENV = [
   "GOOGLE_CLIENT_ID",
   "GOOGLE_CLIENT_SECRET",
@@ -691,4 +693,3 @@ app.listen(PORT, () => {
   console.log(`Frontend URL: ${FRONTEND_URL}`);
   console.log(`OAuth callback URL: ${CALLBACK_URL}`);
 });
-```
