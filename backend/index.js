@@ -27,7 +27,6 @@ const BACKEND_URL = (
 const CALLBACK_URL =
   process.env.GOOGLE_CALLBACK_URL ||
   `${BACKEND_URL}/auth/google/callback`;
-
 const REQUIRED_ENV = [
   "GOOGLE_CLIENT_ID",
   "GOOGLE_CLIENT_SECRET",
