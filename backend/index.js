@@ -13,21 +13,23 @@ const { google } = require("googleapis");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
 const isProduction = process.env.NODE_ENV === "production";
+
+// --------------------------------------------------
+// ENVIRONMENT CONFIGURATION
+// --------------------------------------------------
 
 const FRONTEND_URL = (
   process.env.FRONTEND_URL || "http://localhost:5173"
 ).replace(/\/+$/, "");
 
 const BACKEND_URL = (
-  process.env.BACKEND_URL || "http://localhost:" + PORT
+  process.env.BACKEND_URL || `http://localhost:${PORT}`
 ).replace(/\/+$/, "");
 
 const CALLBACK_URL =
   process.env.GOOGLE_CALLBACK_URL ||
-  BACKEND_URL + "/auth/google/callback";
-
+  `${BACKEND_URL}/auth/google/callback`;
 
 const REQUIRED_ENV = [
   "GOOGLE_CLIENT_ID",
@@ -37,47 +39,54 @@ const REQUIRED_ENV = [
 ];
 
 const missingEnv = REQUIRED_ENV.filter(
-  (name) => !process.env[name]
+  (name) => !process.env[name]?.trim()
 );
 
-if (missingEnv.length > 0) {
+if (missingEnv.length) {
   console.error(
     "Missing environment variables:",
     missingEnv.join(", ")
   );
 }
 
+if (isProduction && missingEnv.length) {
+  console.error(
+    "Configure the missing environment variables in Render."
+  );
+}
+
+if (isProduction && !process.env.FRONTEND_URL) {
+  console.error("FRONTEND_URL is required in production.");
+}
+
+if (isProduction && !process.env.BACKEND_URL) {
+  console.error("BACKEND_URL is required in production.");
+}
+
 if (
   isProduction &&
-  (!process.env.FRONTEND_URL ||
-    !process.env.BACKEND_URL ||
-    !process.env.GOOGLE_CALLBACK_URL)
+  !process.env.GOOGLE_CALLBACK_URL
 ) {
   console.error(
-    "Production requires FRONTEND_URL, BACKEND_URL, and GOOGLE_CALLBACK_URL."
+    "GOOGLE_CALLBACK_URL is required in production."
   );
 }
 
-if (isProduction && !process.env.SESSION_SECRET) {
-  console.error(
-    "SESSION_SECRET must be configured in production."
-  );
-}
+// --------------------------------------------------
+// EXPRESS CONFIGURATION
+// --------------------------------------------------
 
-// Render runs behind a proxy. This allows Express to recognize HTTPS.
 app.set("trust proxy", 1);
 
-// Frontend origins allowed to call this backend.
 const allowedOrigins = [
   FRONTEND_URL,
   "http://localhost:5173",
   "http://127.0.0.1:5173",
-].filter(Boolean);
+];
 
 app.use(
   cors({
-    origin: function (origin, callback) {
-      // Allow requests without an Origin header, such as health checks.
+    origin(origin, callback) {
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -94,7 +103,10 @@ app.use(
 
 app.use(express.json({ limit: "1mb" }));
 
-// Google permissions requested from each visitor.
+// --------------------------------------------------
+// GOOGLE OAUTH CONFIGURATION
+// --------------------------------------------------
+
 const SCOPES = [
   "openid",
   "email",
@@ -102,16 +114,59 @@ const SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
 ];
 
-// MongoDB connection and session store.
+function createOAuthClient(tokens = {}) {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      "Google OAuth Client ID or Client Secret is missing."
+    );
+  }
+
+  return new google.auth.OAuth2(
+    clientId,
+    clientSecret,
+    CALLBACK_URL
+  );
+}
+
+// Safe diagnostics: never log secrets, tokens, or authorization codes.
+function logOAuthError(error) {
+  const googleData = error.response?.data;
+
+  console.error("OAuth error details:", {
+    message: error.message,
+    status: error.response?.status,
+    googleError: googleData?.error,
+    googleDescription: googleData?.error_description,
+    code: error.code,
+  });
+}
+
+// --------------------------------------------------
+// MONGODB AND SESSION CONFIGURATION
+// --------------------------------------------------
+
 let mongoReady = false;
+
+mongoose.connection.on("connected", () => {
+  mongoReady = true;
+  console.log("MongoDB connected successfully");
+});
+
+mongoose.connection.on("disconnected", () => {
+  mongoReady = false;
+  console.error("MongoDB disconnected");
+});
+
+mongoose.connection.on("error", (error) => {
+  console.error("MongoDB error:", error.message);
+});
 
 if (process.env.MONGODB_URI) {
   mongoose
     .connect(process.env.MONGODB_URI)
-    .then(() => {
-      mongoReady = true;
-      console.log("MongoDB connected successfully");
-    })
     .catch((error) => {
       console.error(
         "MongoDB connection failed:",
@@ -120,7 +175,6 @@ if (process.env.MONGODB_URI) {
     });
 }
 
-// Use MongoDB to preserve sessions across requests and server restarts.
 const sessionOptions = {
   name: "bulkmail.sid",
   secret:
@@ -134,6 +188,7 @@ const sessionOptions = {
     secure: isProduction,
     sameSite: isProduction ? "none" : "lax",
     maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: "/",
   },
 };
 
@@ -148,46 +203,28 @@ if (process.env.MONGODB_URI) {
 
 app.use(session(sessionOptions));
 
-// Create an OAuth client.
-function createOAuthClient(tokens = {}) {
-  const client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    CALLBACK_URL
-  );
-
-  client.setCredentials(tokens);
-
-  return client;
-}
-
-// Save a session before sending a response or redirect.
 function saveSession(req) {
   return new Promise((resolve, reject) => {
     req.session.save((error) => {
-      if (error) {
-        return reject(error);
-      }
-
+      if (error) return reject(error);
       resolve();
     });
   });
 }
 
-// Regenerate the session after successful authentication.
 function regenerateSession(req) {
   return new Promise((resolve, reject) => {
     req.session.regenerate((error) => {
-      if (error) {
-        return reject(error);
-      }
-
+      if (error) return reject(error);
       resolve();
     });
   });
 }
 
-// Check whether the visitor has connected Gmail.
+// --------------------------------------------------
+// HELPER FUNCTIONS
+// --------------------------------------------------
+
 function requireGoogleAccount(req, res, next) {
   if (!req.session.googleTokens) {
     return res.status(401).json({
@@ -199,20 +236,21 @@ function requireGoogleAccount(req, res, next) {
   next();
 }
 
-// Basic email validation.
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// Create a Gmail API-compatible MIME message.
 function makeRawEmail({ from, to, subject, text }) {
   const cleanSubject = subject.replace(/[\r\n]+/g, " ");
 
-  const encodedSubject = /^[\x20-\x7E]*$/.test(cleanSubject)
+  const encodedSubject = /^[\x20-\x7E]*$/.test(
+    cleanSubject
+  )
     ? cleanSubject
-    : `=?UTF-8?B?${Buffer.from(cleanSubject, "utf8").toString(
-        "base64"
-      )}?=`;
+    : `=?UTF-8?B?${Buffer.from(
+        cleanSubject,
+        "utf8"
+      ).toString("base64")}?=`;
 
   const encodedBody = Buffer.from(text, "utf8").toString(
     "base64"
@@ -236,14 +274,16 @@ function makeRawEmail({ from, to, subject, text }) {
     .replace(/=+$/g, "");
 }
 
-// Health check.
+// --------------------------------------------------
+// HEALTH CHECKS
+// --------------------------------------------------
+
 app.get("/", (req, res) => {
   res.status(200).send(
     "BulkMail Gmail API backend is running."
   );
 });
 
-// Check backend and database status.
 app.get("/api/health", (req, res) => {
   res.status(mongoReady ? 200 : 503).json({
     success: mongoReady,
@@ -252,7 +292,10 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Start Google OAuth authorization.
+// --------------------------------------------------
+// START GOOGLE OAUTH
+// --------------------------------------------------
+
 app.get("/auth/google", async (req, res) => {
   try {
     if (
@@ -262,7 +305,7 @@ app.get("/auth/google", async (req, res) => {
       !process.env.MONGODB_URI
     ) {
       return res.status(500).send(
-        "Google OAuth or session configuration is missing. Check the backend environment variables."
+        "OAuth configuration is incomplete. Check Render environment variables."
       );
     }
 
@@ -280,13 +323,9 @@ app.get("/auth/google", async (req, res) => {
       state,
     });
 
-    // Ensure the state is saved before redirecting to Google.
     await saveSession(req);
 
-    console.log(
-      "OAuth started. Session ID:",
-      req.sessionID
-    );
+    console.log("OAuth started. Session ID:", req.sessionID);
 
     return res.redirect(authUrl);
   } catch (error) {
@@ -296,12 +335,15 @@ app.get("/auth/google", async (req, res) => {
     );
 
     return res.status(500).send(
-      "Could not start Google authorization. Check the backend logs and MongoDB connection."
+      "Could not start Google authorization. Check the backend logs."
     );
   }
 });
 
-// Google redirects the visitor to this callback after authorization.
+// --------------------------------------------------
+// GOOGLE OAUTH CALLBACK
+// --------------------------------------------------
+
 app.get("/auth/google/callback", async (req, res) => {
   try {
     const { code, state, error } = req.query;
@@ -314,7 +356,7 @@ app.get("/auth/google/callback", async (req, res) => {
     );
 
     if (error) {
-      console.error("Google OAuth error:", error);
+      console.error("Google OAuth authorization error:", error);
 
       return res.redirect(
         `${FRONTEND_URL}/?oauthError=${encodeURIComponent(
@@ -323,27 +365,50 @@ app.get("/auth/google/callback", async (req, res) => {
       );
     }
 
-    // Validate the state to prevent cross-site request forgery.
+    const storedState = req.session.oauthState;
+
+    // Validate the state and check buffer lengths before comparing.
     if (
       typeof code !== "string" ||
       typeof state !== "string" ||
-      typeof req.session.oauthState !== "string" ||
-      !crypto.timingSafeEqual(
-        Buffer.from(state),
-        Buffer.from(req.session.oauthState)
-      )
+      typeof storedState !== "string"
     ) {
       return res.status(400).send(
-        "Invalid OAuth state or session. Return to BulkMail and connect Google again. Check that the frontend and Google callback use the same Render backend URL."
+        "Invalid OAuth state or session. Please reconnect Google."
       );
     }
 
-    // Remove the one-time state value.
+    const suppliedStateBuffer = Buffer.from(state);
+    const storedStateBuffer = Buffer.from(storedState);
+
+    if (
+      suppliedStateBuffer.length !== storedStateBuffer.length ||
+      !crypto.timingSafeEqual(
+        suppliedStateBuffer,
+        storedStateBuffer
+      )
+    ) {
+      return res.status(400).send(
+        "OAuth state validation failed. Please reconnect Google."
+      );
+    }
+
     delete req.session.oauthState;
     await saveSession(req);
 
+    // Exchange the authorization code for Google tokens.
     const oauthClient = createOAuthClient();
-    const { tokens } = await oauthClient.getToken(code);
+
+    let tokens;
+
+    try {
+      const tokenResponse = await oauthClient.getToken(code);
+      tokens = tokenResponse.tokens;
+    } catch (error) {
+      console.error("OAuth token exchange failed.");
+      logOAuthError(error);
+      throw error;
+    }
 
     if (!tokens.access_token) {
       throw new Error(
@@ -351,45 +416,44 @@ app.get("/auth/google/callback", async (req, res) => {
       );
     }
 
-    // Get the connected user's email.
     oauthClient.setCredentials(tokens);
 
+    // Retrieve the Google account's profile.
     const oauth2 = google.oauth2({
       version: "v2",
       auth: oauthClient,
     });
 
-    const profile = await oauth2.userinfo.get();
+    const profileResponse = await oauth2.userinfo.get();
+    const email = profileResponse.data.email;
 
-    if (!profile.data.email) {
+    if (!email) {
       throw new Error(
         "Could not identify the Google account."
       );
     }
 
-    // Regenerate the session after authentication to reduce session-fixation risk.
+    // Regenerate the session after successful authentication.
     await regenerateSession(req);
 
     req.session.googleTokens = {
       ...tokens,
-      email: profile.data.email,
+      email,
     };
 
     await saveSession(req);
 
     console.log(
       "Google OAuth completed successfully for:",
-      profile.data.email
+      email
     );
 
     return res.redirect(
       `${FRONTEND_URL}/?connected=1`
     );
   } catch (error) {
-    console.error(
-      "OAuth callback failed:",
-      error.message
-    );
+    // Do not log authorization codes, tokens, or client secrets.
+    console.error("OAuth callback failed:", error.message);
 
     return res.redirect(
       `${FRONTEND_URL}/?oauthError=authorization_failed`
@@ -397,7 +461,10 @@ app.get("/auth/google/callback", async (req, res) => {
   }
 });
 
-// Return the connected Gmail account for the current browser session.
+// --------------------------------------------------
+// CHECK CONNECTED GMAIL ACCOUNT
+// --------------------------------------------------
+
 app.get("/api/me", async (req, res) => {
   try {
     if (!req.session.googleTokens) {
@@ -416,20 +483,27 @@ app.get("/api/me", async (req, res) => {
       auth,
     });
 
-    const response = await oauth2.userinfo.get();
+    const profileResponse = await oauth2.userinfo.get();
+    const email = profileResponse.data.email;
 
-    // Store refreshed credentials when Google refreshes a token.
+    if (!email) {
+      return res.json({
+        connected: false,
+        email: null,
+      });
+    }
+
     req.session.googleTokens = {
       ...req.session.googleTokens,
       ...auth.credentials,
-      email: response.data.email,
+      email,
     };
 
     await saveSession(req);
 
     return res.json({
       connected: true,
-      email: response.data.email,
+      email,
     });
   } catch (error) {
     console.error(
@@ -439,13 +513,17 @@ app.get("/api/me", async (req, res) => {
 
     return res.status(401).json({
       connected: false,
+      email: null,
       message:
-        "Could not verify your Gmail connection. Please reconnect Google.",
+        "Could not verify Gmail. Please reconnect Google.",
     });
   }
 });
 
-// Send a separate email to each recipient.
+// --------------------------------------------------
+// SEND EMAILS THROUGH GMAIL API
+// --------------------------------------------------
+
 app.post(
   "/api/sendemail",
   requireGoogleAccount,
@@ -491,7 +569,7 @@ app.post(
       ) {
         return res.status(400).json({
           success: false,
-          message: "The recipient list contains an invalid value.",
+          message: "Invalid recipient list.",
         });
       }
 
@@ -503,21 +581,21 @@ app.post(
         ),
       ];
 
-      if (recipients.length === 0) {
+      if (!recipients.length) {
         return res.status(400).json({
           success: false,
           message: "Add at least one valid recipient.",
         });
       }
 
-      const invalid = recipients.filter(
+      const invalidEmail = recipients.find(
         (email) => !isValidEmail(email)
       );
 
-      if (invalid.length > 0) {
+      if (invalidEmail) {
         return res.status(400).json({
           success: false,
-          message: `Invalid email address: ${invalid[0]}`,
+          message: `Invalid email address: ${invalidEmail}`,
         });
       }
 
@@ -531,7 +609,7 @@ app.post(
       if (recipients.length > maxRecipients) {
         return res.status(400).json({
           success: false,
-          message: `Limit: ${maxRecipients} unique recipients per request.`,
+          message: `Limit: ${maxRecipients} recipients per request.`,
         });
       }
 
@@ -549,14 +627,13 @@ app.post(
         auth,
       });
 
-      const profile = await oauth2.userinfo.get();
-      const senderEmail = profile.data.email;
+      const profileResponse = await oauth2.userinfo.get();
+      const senderEmail = profileResponse.data.email;
 
       if (!senderEmail) {
         return res.status(401).json({
           success: false,
-          message:
-            "Could not identify the connected Gmail account. Reconnect Google.",
+          message: "Reconnect your Gmail account.",
         });
       }
 
@@ -577,22 +654,23 @@ app.post(
             requestBody: { raw },
           });
 
-          sent += 1;
+          sent++;
         } catch (error) {
           console.error(
-            `Email failed for ${recipient}:`,
-            error.message
+            "Gmail send failed:",
+            error.response?.data?.error?.message ||
+              error.message
           );
 
           failures.push({
             recipient,
             message:
-              "Gmail could not send this message. Check the address, Gmail limits, and account permissions.",
+              "Gmail could not send this message. Check the address, account permissions, and sending limits.",
           });
         }
       }
 
-      // Save any refreshed Google credentials.
+      // Persist refreshed credentials if Google refreshed them.
       req.session.googleTokens = {
         ...req.session.googleTokens,
         ...auth.credentials,
@@ -601,7 +679,7 @@ app.post(
 
       await saveSession(req);
 
-      if (failures.length > 0) {
+      if (failures.length) {
         return res.status(207).json({
           success: sent > 0,
           sent,
@@ -631,20 +709,23 @@ app.post(
         return res.status(401).json({
           success: false,
           message:
-            "Gmail authorization failed or permission is missing. Reconnect Google and try again.",
+            "Gmail authorization failed. Reconnect Google and try again.",
         });
       }
 
       return res.status(500).json({
         success: false,
         message:
-          "Could not send email. Check the backend logs for details.",
+          "Could not send email. Check the backend logs.",
       });
     }
   }
 );
 
-// Disconnect Gmail from the current browser session.
+// --------------------------------------------------
+// DISCONNECT GMAIL
+// --------------------------------------------------
+
 app.post("/auth/logout", (req, res) => {
   req.session.destroy((error) => {
     if (error) {
@@ -673,7 +754,10 @@ app.post("/auth/logout", (req, res) => {
   });
 });
 
-// Handle unexpected errors.
+// --------------------------------------------------
+// GENERAL ERROR HANDLER
+// --------------------------------------------------
+
 app.use((error, req, res, next) => {
   console.error("Backend error:", error.message);
 
@@ -687,9 +771,30 @@ app.use((error, req, res, next) => {
   });
 });
 
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
 app.listen(PORT, () => {
-  console.log(`BulkMail backend listening on port ${PORT}`);
-  console.log(`Environment: ${isProduction ? "production" : "development"}`);
+  console.log(
+    `BulkMail backend listening on port ${PORT}`
+  );
+
+  console.log(
+    `Environment: ${isProduction ? "production" : "development"}`
+  );
+
   console.log(`Frontend URL: ${FRONTEND_URL}`);
   console.log(`OAuth callback URL: ${CALLBACK_URL}`);
+
+  // Safe credential diagnostics; values are not printed.
+  console.log(
+    "Google Client ID configured:",
+    Boolean(process.env.GOOGLE_CLIENT_ID)
+  );
+
+  console.log(
+    "Google Client Secret configured:",
+    Boolean(process.env.GOOGLE_CLIENT_SECRET)
+  );
 });
